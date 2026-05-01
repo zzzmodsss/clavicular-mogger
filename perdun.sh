@@ -2,8 +2,11 @@
 set -Eeuo pipefail
 
 # Xray REALITY VLESS auto installer / manager
-# Supports: install, reconfigure, client links, status, logs, uninstall
-# Run as root: bash xray_reality_auto_installer.sh
+# Run as root:
+#   sudo bash perdun_fixed.sh
+#   sudo bash perdun_fixed.sh install
+#   sudo bash perdun_fixed.sh reconfigure
+#   sudo bash perdun_fixed.sh links
 
 APP_NAME="nginx-stream"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
@@ -12,7 +15,7 @@ CONFIG_FILE="${CONFIG_DIR}/stream.json"
 STATE_FILE="${CONFIG_DIR}/state.env"
 LINKS_FILE="${CONFIG_DIR}/client-links.txt"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-GEODATA_DIR="/usr/local/bin"
+GEODATA_DIR="/usr/local/share/xray"
 DEFAULT_PATH="/xhttp-main"
 DEFAULT_GRPC_SERVICE="xraygrpc"
 
@@ -42,14 +45,17 @@ install_deps() {
 
 install_xray() {
   log "Скачиваю Xray и маскирую бинарь как ${APP_NAME}"
+  local tmpdir arch asset
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' RETURN
+
   arch="$(uname -m)"
   case "${arch}" in
     x86_64|amd64) asset="Xray-linux-64.zip" ;;
     aarch64|arm64) asset="Xray-linux-arm64-v8a.zip" ;;
     *) err "Неизвестная архитектура: ${arch}. Нужен x86_64/amd64 или arm64/aarch64"; exit 1 ;;
   esac
+
   curl -fL "https://github.com/XTLS/Xray-core/releases/latest/download/${asset}" -o "${tmpdir}/xray.zip"
   unzip -o "${tmpdir}/xray.zip" xray -d "${tmpdir}"
   install -m 0755 "${tmpdir}/xray" "${BIN_PATH}"
@@ -58,11 +64,26 @@ install_xray() {
 
 generate_keys() {
   UUID="${UUID:-$(${BIN_PATH} uuid)}"
+  local keypair
   keypair="$(${BIN_PATH} x25519)"
-  PRIVATE_KEY="${PRIVATE_KEY:-$(echo "${keypair}" | awk -F': ' '/Private key/ {print $2}') }"
-  PUBLIC_KEY="${PUBLIC_KEY:-$(echo "${keypair}" | awk -F': ' '/Public key/ {print $2}') }"
+
+  # Разные версии Xray пишут по-разному:
+  #   Private key: ...
+  #   Public key: ...
+  # или как у тебя:
+  #   PrivateKey: ...
+  #   Password (PublicKey): ...
+  PRIVATE_KEY="${PRIVATE_KEY:-$(echo "${keypair}" | awk -F': ' '/Private[[:space:]]*[Kk]ey|PrivateKey/ {print $2; exit}')}"
+  PUBLIC_KEY="${PUBLIC_KEY:-$(echo "${keypair}" | awk -F': ' '/Public[[:space:]]*[Kk]ey|PublicKey|Password \(PublicKey\)/ {print $2; exit}')}"
   PRIVATE_KEY="$(echo "${PRIVATE_KEY}" | xargs)"
   PUBLIC_KEY="$(echo "${PUBLIC_KEY}" | xargs)"
+
+  if [[ -z "${PRIVATE_KEY}" || -z "${PUBLIC_KEY}" ]]; then
+    err "Не смог распарсить вывод x25519:"
+    echo "${keypair}"
+    exit 1
+  fi
+
   SHORT_ID="${SHORT_ID:-$(openssl rand -hex 8)}"
 }
 
@@ -133,6 +154,7 @@ ask_secret() {
 }
 
 choose_network() {
+  local old="${NETWORK:-xhttp}"
   echo "Выбери transport:"
   echo "1) xhttp  - рекомендовано"
   echo "2) grpc"
@@ -140,13 +162,15 @@ choose_network() {
   echo "4) httpupgrade"
   echo "5) tcp/raw"
   local n
-  read -r -p "Номер [1]: " n || true
-  case "${n:-1}" in
+  read -r -p "Номер [${old}]: " n || true
+  case "${n:-}" in
     1) NETWORK="xhttp" ;;
     2) NETWORK="grpc" ;;
     3) NETWORK="ws" ;;
     4) NETWORK="httpupgrade" ;;
     5) NETWORK="tcp" ;;
+    "") NETWORK="${old}" ;;
+    xhttp|grpc|ws|httpupgrade|tcp|raw) NETWORK="${n}" ;;
     *) NETWORK="xhttp" ;;
   esac
 }
@@ -159,9 +183,7 @@ collect_config() {
   ask SNI "SNI / serverName" "${SNI:-api-maps.yandex.ru}"
   ask DEST "REALITY target host:port" "${DEST:-${SNI}:443}"
 
-  old_net="${NETWORK:-xhttp}"
   choose_network
-  [[ -z "${NETWORK:-}" ]] && NETWORK="${old_net}"
 
   ask PATH_VALUE "Path для xhttp/ws/httpupgrade" "${PATH_VALUE:-${DEFAULT_PATH}}"
   ask GRPC_SERVICE "serviceName для grpc" "${GRPC_SERVICE:-${DEFAULT_GRPC_SERVICE}}"
@@ -173,6 +195,7 @@ collect_config() {
   local ss_choice
   read -r -p "Выбор [${SS_ENABLED:-1}]: " ss_choice || true
   ss_choice="${ss_choice:-${SS_ENABLED:-1}}"
+
   if [[ "${ss_choice}" == "1" || "${ss_choice}" == "yes" || "${ss_choice}" == "true" ]]; then
     SS_ENABLED="1"
     ask SS_ADDRESS "Shadowsocks address" "${SS_ADDRESS:-}"
@@ -189,7 +212,11 @@ collect_config() {
 
   read -r -p "Поставить traffic-guard? y/N [${TG_ENABLED:-0}]: " tg || true
   tg="${tg:-${TG_ENABLED:-0}}"
-  if [[ "${tg}" =~ ^([yY][eE][sS]|[yY]|1)$ ]]; then TG_ENABLED="1"; else TG_ENABLED="0"; fi
+  if [[ "${tg}" =~ ^([yY][eE][sS]|[yY]|1)$ ]]; then
+    TG_ENABLED="1"
+  else
+    TG_ENABLED="0"
+  fi
 
   if [[ -z "${UUID:-}" || -z "${PRIVATE_KEY:-}" || -z "${PUBLIC_KEY:-}" || -z "${SHORT_ID:-}" ]]; then
     generate_keys
@@ -197,8 +224,8 @@ collect_config() {
 }
 
 transport_json() {
-  local net_json_name="$1"
-  case "${net_json_name}" in
+  local net="$1"
+  case "${net}" in
     xhttp)
       jq -n --arg path "${PATH_VALUE}" '{network:"xhttp", settings:{xhttpSettings:{path:$path, mode:"auto"}}}'
       ;;
@@ -225,10 +252,12 @@ write_config() {
   mkdir -p "${CONFIG_DIR}"
   chmod 700 "${CONFIG_DIR}"
 
+  local transport network_for_xray settings_obj flow_value default_outbound
   transport="$(transport_json "${NETWORK}")"
   network_for_xray="$(echo "${transport}" | jq -r '.network')"
   settings_obj="$(echo "${transport}" | jq -c '.settings')"
   flow_value=""
+
   if [[ "${NETWORK}" == "tcp" || "${NETWORK}" == "raw" ]]; then
     flow_value="xtls-rprx-vision"
   fi
@@ -338,10 +367,49 @@ write_config() {
   "${BIN_PATH}" run -test -c "${CONFIG_FILE}"
 }
 
+download_one_geodata() {
+  local name="$1"
+  shift
+  local tmp="${GEODATA_DIR}/${name}.tmp"
+  local url
+
+  mkdir -p "${GEODATA_DIR}"
+
+  for url in "$@"; do
+    info "Пробую скачать ${name}: ${url}"
+    if curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "${url}" -o "${tmp}"; then
+      if [[ -s "${tmp}" ]] && [[ "$(stat -c%s "${tmp}")" -gt 1024 ]]; then
+        mv "${tmp}" "${GEODATA_DIR}/${name}"
+        chmod 644 "${GEODATA_DIR}/${name}"
+        ln -sf "${GEODATA_DIR}/${name}" "/usr/local/bin/${name}" || true
+        log "${name} скачан в ${GEODATA_DIR}/${name}"
+        return 0
+      else
+        warn "${name} скачался подозрительно маленьким, пробую другой URL"
+      fi
+    else
+      warn "Не скачалось с этого URL"
+    fi
+  done
+
+  rm -f "${tmp}"
+  err "Не смог скачать ${name}. Проверь доступ к GitHub/CDN с сервера."
+  return 1
+}
+
 install_geodata() {
   log "Скачиваю geosite.dat и geoip.dat"
-  curl -fL https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat -o "${GEODATA_DIR}/geosite.dat"
-  curl -fL https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat -o "${GEODATA_DIR}/geoip.dat"
+  mkdir -p "${GEODATA_DIR}"
+
+  download_one_geodata geosite.dat \
+    "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" \
+    "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat" \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+
+  download_one_geodata geoip.dat \
+    "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat" \
+    "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat" \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 }
 
 write_service() {
@@ -353,6 +421,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=XRAY_LOCATION_ASSET=${GEODATA_DIR}
 ExecStart=${BIN_PATH} run -c ${CONFIG_FILE}
 Restart=always
 RestartSec=5
@@ -362,6 +431,7 @@ LimitNOFILE=1000000
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
   systemctl enable --now "${APP_NAME}"
 }
@@ -378,8 +448,10 @@ install_traffic_guard() {
     warn "traffic-guard пропущен"
     return 0
   fi
+
   log "Устанавливаю traffic-guard"
   curl -fsSL https://raw.githubusercontent.com/dotX12/traffic-guard/master/install.sh | bash
+
   traffic-guard full \
     -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list \
     -u https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/26929c9db71443a18c4369299ba60673a792c2ac/public/government_networks.list \
@@ -393,10 +465,7 @@ urlenc() {
 
 client_link() {
   load_state
-  local type="${NETWORK}"
-  local flow=""
-  local extra=""
-  local enc_path enc_service enc_sni enc_sid enc_pb enc_host name
+  local extra enc_path enc_service enc_sni enc_sid enc_pb enc_host name
   enc_sni="$(urlenc "${SNI}")"
   enc_sid="$(urlenc "${SHORT_ID}")"
   enc_pb="$(urlenc "${PUBLIC_KEY}")"
@@ -421,9 +490,10 @@ client_link() {
       extra="&type=httpupgrade&path=${enc_path}&host=${enc_sni}"
       ;;
     tcp|raw)
-      type="tcp"
-      flow="&flow=xtls-rprx-vision"
-      extra="&type=tcp&headerType=none${flow}"
+      extra="&type=tcp&headerType=none&flow=xtls-rprx-vision"
+      ;;
+    *)
+      extra="&type=xhttp"
       ;;
   esac
 
@@ -448,6 +518,7 @@ show_summary() {
   echo "UUID: ${UUID}"
   echo "Public key: ${PUBLIC_KEY}"
   echo "Short ID: ${SHORT_ID}"
+  echo "Geodata: ${GEODATA_DIR}"
   echo
   echo "Клиентская ссылка:"
   cat "${LINKS_FILE}" 2>/dev/null || client_link
@@ -482,6 +553,7 @@ reconfigure() {
   collect_config
   save_state
   write_config
+  install_geodata
   configure_firewall
   systemctl restart "${APP_NAME}"
   write_links
