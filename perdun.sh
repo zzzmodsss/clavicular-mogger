@@ -74,6 +74,8 @@ load_state() {
 }
 
 save_state() {
+  mkdir -p "${CONFIG_DIR}"
+  chmod 700 "${CONFIG_DIR}"
   umask 077
   cat >"${STATE_FILE}" <<EOF
 SERVER_IP='${SERVER_IP}'
@@ -333,7 +335,7 @@ write_config() {
 
   chmod 600 "${CONFIG_FILE}"
   log "Конфиг записан: ${CONFIG_FILE}"
-  "${BIN_PATH}" test -c "${CONFIG_FILE}"
+  "${BIN_PATH}" run -test -c "${CONFIG_FILE}"
 }
 
 install_geodata() {
