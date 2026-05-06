@@ -532,11 +532,11 @@ show_summary() {
 install_all() {
   need_root
   install_deps
+  install_geodata
   install_xray
   collect_config
   save_state
   write_config
-  install_geodata
   write_service
   configure_firewall
   install_traffic_guard
